@@ -12,7 +12,8 @@ interface IERC20Decimals {
 contract BaccaratETC is Ownable {
     using SafeERC20 for IERC20;
 
-    uint256 public constant MAX_BET = 20;
+    uint256 public maxBet;
+    uint256 public houseCutPercentage; // 1 = 1%, 100 = 100%
     uint256 public constant HOUSE_MIN_CUT = 1;
     
     enum Position { Banker, Player }
@@ -41,9 +42,13 @@ contract BaccaratETC is Ownable {
     event TokenRemoved(address indexed token);
     event Paused(address account);
     event Unpaused(address account);
+    event MaxBetUpdated(uint256 newMaxBet);
+    event HouseCutUpdated(uint256 newHouseCutPercentage);
+    event ContractFunded(address indexed token, uint256 amount);
 
     constructor() Ownable(msg.sender) {
-        // Initialize with default token if needed
+        maxBet = 10; // Default max bet
+        houseCutPercentage = 5; // Default 5% house cut
     }
 
     modifier validToken(address token) {
@@ -59,6 +64,25 @@ contract BaccaratETC is Ownable {
     modifier whenPaused() {
         require(paused, "Contract not paused");
         _;
+    }
+
+    function setMaxBet(uint256 newMaxBet) external onlyOwner {
+        require(newMaxBet > 0, "Max bet must be positive");
+        maxBet = newMaxBet;
+        emit MaxBetUpdated(newMaxBet);
+    }
+
+    function setHouseCutPercentage(uint256 newPercentage) external onlyOwner {
+        require(newPercentage > 0 && newPercentage <= 100, "Invalid percentage");
+        houseCutPercentage = newPercentage;
+        emit HouseCutUpdated(newPercentage);
+    }
+
+    function fundContract(address tokenAddress, uint256 amount) external onlyOwner validToken(tokenAddress) {
+        require(amount > 0, "Amount must be positive");
+        IERC20(tokenAddress).safeTransferFrom(msg.sender, address(this), amount);
+        houseBalances[tokenAddress] += amount;
+        emit ContractFunded(tokenAddress, amount);
     }
 
     function addToken(address tokenAddress) external onlyOwner {
@@ -91,7 +115,7 @@ contract BaccaratETC is Ownable {
     }
 
     function startGame(uint256 amount, Position position, address tokenAddress) external validToken(tokenAddress) whenNotPaused {
-        require(amount > 0 && amount <= MAX_BET, "Invalid bet amount");
+        require(amount > 0 && amount <= maxBet, "Invalid bet amount");
         require(balances[msg.sender][tokenAddress] >= amount, "Insufficient balance");
         require(games[msg.sender].commitBlock == 0, "Existing game pending");
 
@@ -130,23 +154,16 @@ contract BaccaratETC is Ownable {
     }
 
     function closeout(address tokenAddress) external onlyOwner whenPaused validToken(tokenAddress) {
-        uint256 amount = houseBalances[tokenAddress];
+        // Get total contract balance
+        uint256 contractBalance = IERC20(tokenAddress).balanceOf(address(this));
+        
+        // Reset house balance
         houseBalances[tokenAddress] = 0;
         
-        uint256 contractBalance = IERC20(tokenAddress).balanceOf(address(this));
-        uint256 userFunds = _totalUserBalances(tokenAddress);
-        uint256 withdrawable = contractBalance > userFunds ? contractBalance - userFunds : 0;
-        
-        if (withdrawable > 0) {
-            IERC20(tokenAddress).safeTransfer(owner(), withdrawable);
+        // Transfer all remaining balance to owner
+        if (contractBalance > 0) {
+            IERC20(tokenAddress).safeTransfer(owner(), contractBalance);
         }
-        if (amount > 0) {
-            IERC20(tokenAddress).safeTransfer(owner(), amount);
-        }
-    }
-
-    function _totalUserBalances(address tokenAddress) internal view returns (uint256) {
-        return IERC20(tokenAddress).balanceOf(address(this)) - houseBalances[tokenAddress];
     }
 
     function _generateResults(uint256 commitBlock) internal view returns (uint8, uint8) {
@@ -170,27 +187,37 @@ contract BaccaratETC is Ownable {
         Game storage game = games[msg.sender];
         
         if (result == GameResult.Tie) {
+            // On tie, return original bet and ensure house balance isn't affected
+            houseBalances[game.token] -= betAmount; // Remove the bet from house balance
             return betAmount; // PUSH - return original bet on tie
         }
 
         if (uint(position) != uint(result)) {
-            return 0; // Player lost
+            // Player lost - bet goes to house
+            houseBalances[game.token] += betAmount;
+            return 0;
         }
 
         if (position == Position.Banker) {
-            uint256 payout = (betAmount * 19) / 20;
-            uint256 houseCut = betAmount - payout;
+            // For Banker wins, implement (19/20) payout structure
+            uint256 totalPayout = betAmount * 2; // Total amount including original bet
+            uint256 commission = (totalPayout * houseCutPercentage) / 100;
             
-            if (houseCut < HOUSE_MIN_CUT) {
-                houseCut = HOUSE_MIN_CUT;
-                payout = betAmount - houseCut;
+            if (commission < HOUSE_MIN_CUT) {
+                commission = HOUSE_MIN_CUT;
             }
             
-            houseBalances[game.token] += houseCut;
+            uint256 payout = totalPayout - commission;
+            houseBalances[game.token] += commission;
+            houseBalances[game.token] -= betAmount; // Remove the original bet from house balance
             return payout;
         }
 
-        return betAmount * 2; // Player win
+        // Player win on Player position
+        uint256 playerPayout = betAmount * 2;
+        require(houseBalances[game.token] >= playerPayout, "Insufficient house balance");
+        houseBalances[game.token] -= playerPayout;
+        return playerPayout;
     }
 
     function withdraw(uint256 amount, address tokenAddress) external validToken(tokenAddress) whenNotPaused {
